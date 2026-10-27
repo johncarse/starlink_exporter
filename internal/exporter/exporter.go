@@ -9,6 +9,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/danopstech/starlink_exporter/pkg/spacex.com/api/device"
@@ -313,28 +314,17 @@ func (e *Exporter) collectDishContext(ch chan<- prometheus.Metric) bool {
 	resp, err := e.Client.Handle(ctx, req)
 	if err != nil {
 		st, ok := status.FromError(err)
-		if ok && st.Code() != 7 {
-			log.Errorf("failed to collect dish context: %s", err.Error())
-			return false
+		if ok && st.Code() == codes.PermissionDenied {
+			// Current firmware no longer allows dish_get_context. Device info and
+			// uptime are exported from get_status instead; skip the context-only
+			// metrics rather than exporting zeros.
+			return true
 		}
+		log.Errorf("failed to collect dish context: %s", err.Error())
+		return false
 	}
 
 	dishC := resp.GetDishGetContext()
-	dishI := dishC.GetDeviceInfo()
-	dishS := dishC.GetDeviceState()
-
-	ch <- prometheus.MustNewConstMetric(
-		dishInfo, prometheus.GaugeValue, 1.00,
-		dishI.GetId(),
-		dishI.GetHardwareVersion(),
-		dishI.GetSoftwareVersion(),
-		dishI.GetCountryCode(),
-		fmt.Sprint(dishI.GetUtcOffsetS()),
-	)
-
-	ch <- prometheus.MustNewConstMetric(
-		dishUptimeSeconds, prometheus.GaugeValue, float64(dishS.GetUptimeS()),
-	)
 
 	ch <- prometheus.MustNewConstMetric(
 		dishCellId, prometheus.GaugeValue, float64(dishC.GetCellId()),
@@ -377,6 +367,20 @@ func (e *Exporter) collectDishStatus(ch chan<- prometheus.Metric) bool {
 	}
 
 	dishStatus := resp.GetDishGetStatus()
+	dishI := dishStatus.GetDeviceInfo()
+
+	ch <- prometheus.MustNewConstMetric(
+		dishInfo, prometheus.GaugeValue, 1.00,
+		dishI.GetId(),
+		dishI.GetHardwareVersion(),
+		dishI.GetSoftwareVersion(),
+		dishI.GetCountryCode(),
+		fmt.Sprint(dishI.GetUtcOffsetS()),
+	)
+
+	ch <- prometheus.MustNewConstMetric(
+		dishUptimeSeconds, prometheus.GaugeValue, float64(dishStatus.GetDeviceState().GetUptimeS()),
+	)
 
 	ch <- prometheus.MustNewConstMetric(
 		dishState, prometheus.GaugeValue, float64(dishStatus.GetState().Number()),
