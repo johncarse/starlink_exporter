@@ -3,6 +3,7 @@ package exporter
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -90,14 +91,14 @@ var (
 		"Latency of connection in seconds",
 		nil, nil,
 	)
-	dishUplinkThroughputBytes = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, "dish", "uplink_throughput_bytes"),
-		"Amount of bandwidth in bytes per second upload",
+	dishUplinkThroughputBps = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "dish", "uplink_throughput_bps"),
+		"Amount of bandwidth in bits per second upload",
 		nil, nil,
 	)
-	dishDownlinkThroughputBytes = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, "dish", "downlink_throughput_bytes"),
-		"Amount of bandwidth in bytes per second download",
+	dishDownlinkThroughputBps = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "dish", "downlink_throughput_bps"),
+		"Amount of bandwidth in bits per second download",
 		nil, nil,
 	)
 
@@ -189,6 +190,24 @@ var (
 	dishDesiredBoreSightElevationDeg = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "dish", "desired_bore_sight_elevation_deg"),
 		"Elevation the dish wants to point at in degrees",
+		nil, nil,
+	)
+
+	dishState = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "dish", "state"),
+		"Derived dish connectivity state, 1 for the active state (CONNECTED when the dish reports no outage)",
+		[]string{"state"}, nil,
+	)
+
+	// collectDishPower
+	dishPowerInputWatts = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "dish", "power_input_watts"),
+		"Most recent power draw of the dish in watts",
+		nil, nil,
+	)
+	dishPowerInputMeanWatts = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "dish", "power_input_mean_watts"),
+		"Mean power draw of the dish in watts over the dish's history window (about 15 minutes)",
 		nil, nil,
 	)
 
@@ -362,8 +381,8 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- dishSecondsToFirstNonemptySlot
 	ch <- dishPopPingDropRatio
 	ch <- dishPopPingLatencySeconds
-	ch <- dishUplinkThroughputBytes
-	ch <- dishDownlinkThroughputBytes
+	ch <- dishUplinkThroughputBps
+	ch <- dishDownlinkThroughputBps
 	ch <- dishBoreSightAzimuthDeg
 	ch <- dishBoreSightElevationDeg
 
@@ -385,6 +404,12 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- dishTiltAngleDeg
 	ch <- dishDesiredBoreSightAzimuthDeg
 	ch <- dishDesiredBoreSightElevationDeg
+
+	ch <- dishState
+
+	// collectDishPower
+	ch <- dishPowerInputWatts
+	ch <- dishPowerInputMeanWatts
 
 	// collectDishSoftwareUpdate
 	ch <- dishSoftwareUpdateState
@@ -425,6 +450,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		e.collectDishSoftwareUpdate(ch, dishStatus)
 		e.collectDishObstructions(ch, dishStatus)
 		e.collectDishAlerts(ch, dishStatus)
+		e.collectDishPower(ch)
 	} else {
 		ok = false
 	}
@@ -543,11 +569,11 @@ func (e *Exporter) collectDishStatus(ch chan<- prometheus.Metric, dishStatus *de
 	)
 
 	ch <- prometheus.MustNewConstMetric(
-		dishUplinkThroughputBytes, prometheus.GaugeValue, float64(dishStatus.GetUplinkThroughputBps()),
+		dishUplinkThroughputBps, prometheus.GaugeValue, float64(dishStatus.GetUplinkThroughputBps()),
 	)
 
 	ch <- prometheus.MustNewConstMetric(
-		dishDownlinkThroughputBytes, prometheus.GaugeValue, float64(dishStatus.GetDownlinkThroughputBps()),
+		dishDownlinkThroughputBps, prometheus.GaugeValue, float64(dishStatus.GetDownlinkThroughputBps()),
 	)
 
 	ch <- prometheus.MustNewConstMetric(
@@ -583,6 +609,13 @@ func (e *Exporter) collectDishHealth(ch chan<- prometheus.Metric, dishStatus *de
 	} {
 		ch <- prometheus.MustNewConstMetric(
 			dishReadyState, prometheus.GaugeValue, flool(v), name,
+		)
+	}
+
+	state := dishConnectionState(dishStatus)
+	for _, name := range dishConnectionStates() {
+		ch <- prometheus.MustNewConstMetric(
+			dishState, prometheus.GaugeValue, flool(name == state), name,
 		)
 	}
 
@@ -680,6 +713,80 @@ func (e *Exporter) collectDishAlerts(ch chan<- prometheus.Metric, dishStatus *de
 	} {
 		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, flool(v))
 	}
+}
+
+// dishConnectionState derives a connectivity state the way sparky8512's
+// starlink-grpc-tools does: current firmware has no plain state field, only an
+// outage record. No outage means CONNECTED; NO_SCHEDULE is reported as
+// SEARCHING; any other cause is reported under its own name.
+func dishConnectionState(dishStatus *device.DishGetStatusResponse) string {
+	outage := dishStatus.GetOutage()
+	if outage == nil {
+		return "CONNECTED"
+	}
+	if outage.GetCause() == device.DishOutage_NO_SCHEDULE {
+		return "SEARCHING"
+	}
+	if name, ok := device.DishOutage_Cause_name[int32(outage.GetCause())]; ok {
+		return name
+	}
+	return "UNKNOWN"
+}
+
+// dishConnectionStates lists every value dishConnectionState can return, in a
+// stable order, so each scrape exports the full set with 0/1 values.
+func dishConnectionStates() []string {
+	states := []string{"CONNECTED", "SEARCHING"}
+	var causes []int
+	for num, name := range device.DishOutage_Cause_name {
+		if name != "NO_SCHEDULE" {
+			causes = append(causes, int(num))
+		}
+	}
+	sort.Ints(causes)
+	for _, num := range causes {
+		states = append(states, device.DishOutage_Cause_name[int32(num)])
+	}
+	return states
+}
+
+// collectDishPower exports the dish's power draw from get_history. History is
+// the heaviest call, so failures are logged and skipped rather than failing the
+// scrape.
+func (e *Exporter) collectDishPower(ch chan<- prometheus.Metric) {
+	req := &device.Request{
+		Request: &device.Request_GetHistory{},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+	defer cancel()
+	resp, err := e.Client.Handle(ctx, req)
+	if err != nil {
+		log.Errorf("failed to collect history from dish: %s", err.Error())
+		return
+	}
+
+	history := resp.GetDishGetHistory()
+	samples := history.GetPowerIn()
+	if len(samples) == 0 {
+		return
+	}
+
+	// The history is a ring buffer: current counts every sample ever taken, so
+	// the newest one sits just behind current modulo the buffer length.
+	latest := samples[(history.GetCurrent()+uint64(len(samples))-1)%uint64(len(samples))]
+
+	var sum float64
+	for _, v := range samples {
+		sum += float64(v)
+	}
+
+	ch <- prometheus.MustNewConstMetric(
+		dishPowerInputWatts, prometheus.GaugeValue, float64(latest),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		dishPowerInputMeanWatts, prometheus.GaugeValue, sum/float64(len(samples)),
+	)
 }
 
 func flool(b bool) float64 {

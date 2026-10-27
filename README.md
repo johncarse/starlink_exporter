@@ -36,6 +36,7 @@ Usage of starlink_exporter
 ```bash
 go build ./cmd/starlink_exporter
 ./starlink_exporter [flags]
+go test ./...
 ```
 
 ### Container image
@@ -116,8 +117,8 @@ scrape_configs
 # TYPE starlink_dish_desired_bore_sight_azimuth_deg gauge
 # HELP starlink_dish_desired_bore_sight_elevation_deg Elevation the dish wants to point at in degrees
 # TYPE starlink_dish_desired_bore_sight_elevation_deg gauge
-# HELP starlink_dish_downlink_throughput_bytes Amount of bandwidth in bytes per second download
-# TYPE starlink_dish_downlink_throughput_bytes gauge
+# HELP starlink_dish_downlink_throughput_bps Amount of bandwidth in bits per second download
+# TYPE starlink_dish_downlink_throughput_bps gauge
 # HELP starlink_dish_eth_speed_mbps Negotiated speed of the dish ethernet link in Mbps
 # TYPE starlink_dish_eth_speed_mbps gauge
 # HELP starlink_dish_first_nonempty_slot_seconds Seconds to next non empty slot
@@ -134,6 +135,10 @@ scrape_configs
 # TYPE starlink_dish_pop_ping_drop_ratio gauge
 # HELP starlink_dish_pop_ping_latency_seconds Latency of connection in seconds
 # TYPE starlink_dish_pop_ping_latency_seconds gauge
+# HELP starlink_dish_power_input_mean_watts Mean power draw of the dish in watts over the dish's history window (about 15 minutes)
+# TYPE starlink_dish_power_input_mean_watts gauge
+# HELP starlink_dish_power_input_watts Most recent power draw of the dish in watts
+# TYPE starlink_dish_power_input_watts gauge
 # HELP starlink_dish_prolonged_obstruction_duration_seconds Average in seconds of prolonged obstructions
 # TYPE starlink_dish_prolonged_obstruction_duration_seconds gauge
 # HELP starlink_dish_prolonged_obstruction_interval_seconds Average prolonged obstruction interval in seconds
@@ -156,12 +161,14 @@ scrape_configs
 # TYPE starlink_dish_software_update_reboot_scheduled_timestamp_seconds gauge
 # HELP starlink_dish_software_update_state Current software update state, 1 for the active state
 # TYPE starlink_dish_software_update_state gauge
+# HELP starlink_dish_state Derived dish connectivity state, 1 for the active state (CONNECTED when the dish reports no outage)
+# TYPE starlink_dish_state gauge
 # HELP starlink_dish_tilt_angle_deg Tilt of the dish from vertical in degrees
 # TYPE starlink_dish_tilt_angle_deg gauge
 # HELP starlink_dish_up Was the last query of Starlink dish successful.
 # TYPE starlink_dish_up gauge
-# HELP starlink_dish_uplink_throughput_bytes Amount of bandwidth in bytes per second upload
-# TYPE starlink_dish_uplink_throughput_bytes gauge
+# HELP starlink_dish_uplink_throughput_bps Amount of bandwidth in bits per second upload
+# TYPE starlink_dish_uplink_throughput_bps gauge
 # HELP starlink_dish_uptime_seconds Dish running time
 # TYPE starlink_dish_uptime_seconds gauge
 # HELP starlink_dish_valid_seconds Unknown
@@ -170,11 +177,13 @@ scrape_configs
 
 Notes:
 
-- `starlink_dish_*_throughput_bytes` keep their upstream names but carry bits per second.
+- `starlink_dish_*_throughput_bps` replace upstream's `*_throughput_bytes`, which always carried bits per second despite the name.
+- `starlink_dish_state{state}` is derived the way [starlink-grpc-tools](https://github.com/sparky8512/starlink-grpc-tools) does it, because current firmware has no plain state field: CONNECTED when the dish reports no outage, SEARCHING for a NO_SCHEDULE outage, otherwise the outage cause (BOOTING, STOWED, NO_SATS, OBSTRUCTED and so on). Exactly one series is 1.
+- `starlink_dish_power_input_watts` is the newest sample from `get_history`; `power_input_mean_watts` is the mean over the dish's history window (about 15 minutes).
 - `starlink_dish_software_update_state{state}` is 1 for the active state and 0 for the rest.
 - `starlink_dish_software_update_reboot_scheduled_timestamp_seconds` is the Unix time of the scheduled update reboot, 0 when none is scheduled.
 - `starlink_dish_cell_id`, `pop_rack_id`, `initial_satellite_id`, `initial_gateway_id`, `backup_beam` and `time_to_slot_end_seconds` come from `dish_get_context`, which current firmware denies. They are exported only when the dish allows that call, so they are not in the list above.
-- Removed because current firmware no longer sends the fields: `starlink_dish_state`, `starlink_dish_snr`, `starlink_dish_last_24h_obstructed_seconds` and the `wedge` obstruction ratios. Use `snr_above_noise_floor` and `ready_state` instead.
+- Removed because current firmware no longer sends the fields: `starlink_dish_state`, `starlink_dish_snr`, `starlink_dish_last_24h_obstructed_seconds` and the `wedge` obstruction ratios. Use `snr_above_noise_floor`, `ready_state` and the label-based `state` instead.
 
 ## Example Grafana Dashboard:
 
