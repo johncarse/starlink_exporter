@@ -11,9 +11,11 @@ This is a fork of [danopstech/starlink_exporter](https://github.com/danopstech/s
 - regenerates `pkg/` from the descriptors the dish serves over gRPC reflection (`hack/regen-protos.sh`);
 - reads device info and uptime from `get_status`, because current firmware answers `dish_get_context` with `PermissionDenied`;
 - fetches `get_status` once per scrape instead of three times;
-- adds ethernet speed, SNR flags, subsystem readiness, GPS, alignment, software update state and the full alert set (see below).
+- adds ethernet speed, SNR flags, subsystem readiness, GPS, alignment, software update state and the full alert set (see below);
+- adds a 16-sector obstruction map summary, 15 minute history summaries (throughput, latency, drops, power) and per-cause outage counters;
+- ships a Grafana dashboard, `dashboards/starlink.json`.
 
-Metric names that existed upstream and still exist on current firmware are unchanged, so the [Grafana dashboard](https://grafana.com/grafana/dashboards/14337) keeps working.
+Metric names that existed upstream and still exist on current firmware are unchanged. Two were renamed because they were wrong: `*_throughput_bytes` is now `*_throughput_bps` (the value was always bits per second). The community [dashboard 14337](https://grafana.com/grafana/dashboards/14337) was written for upstream and still queries the old names and `snr`, so use the dashboard in this repo instead (see [Grafana dashboard](#grafana-dashboard)).
 
 ## Usage:
 
@@ -67,6 +69,24 @@ scrape_configs
         - targets: ['localhost:9817']
 ...
 ```
+
+## Grafana dashboard
+
+`dashboards/starlink.json` is a dashboard for this exporter. It uses only `starlink_dish_*` metrics, so it needs nothing else in your Prometheus. Import it from the Grafana UI (Dashboards, New, Import), pick your Prometheus data source, or provision it from a file. It has a `Data source` variable and a `Job` variable (the Prometheus job that scrapes the exporter, so several dishes can share one Prometheus).
+
+| Panels | What they show |
+|---|---|
+| State now, Ethernet speed, Firmware, Uptime, Boots, Obstructed now | The dish at a glance. Ethernet speed under 1000 Mbps points at a damaged cable or connector. |
+| PoP latency / ping drop, Throughput | Live latency to the Starlink point of presence, lost pings, and traffic through the dish. |
+| Download, Upload, PoP latency: hourly | Hourly p95 and max built from the dish's own 15 minute history summaries (`starlink_dish_history_*`). This is real traffic, so it is a floor on capacity rather than a speed test. |
+| Obstruction by compass sector, Obstructed share by sector | The obstruction map folded into 16 compass sectors: how much of the sector is obstructed, the elevation above which it is clear (the top of the skyline), and how much of it has been observed. The table is sorted worst first. |
+| Dish pointing, Power draw | Azimuth, elevation and tilt, and input power. The dish re-aligns itself after a reboot. |
+| Outage time by cause, Outages in the selected range | Outages by cause, from `starlink_dish_outage_seconds_total` and `starlink_dish_outages_total`. |
+| Link state over time, Software update state | State timelines, with a "Dish rebooted" annotation whenever `starlink_dish_boot_count` changes. |
+
+Two things to know when reading the obstruction panels. The dish empties its obstruction map on every reboot and refills it as satellites pass, which takes about a day, so check the Observed column before trusting a sector that suddenly reads clear. And the dish only sees the sky above its usable elevation (about 25 degrees on the install this was built against), so a sector's "clear above" is never lower than the lowest elevation the dish has observed.
+
+The dashboard JSON is checked by `go test ./...`: every metric it queries must be one the exporter exports, every data source reference must use the variable, and panel ids and titles must be unique, so a renamed metric fails the build instead of leaving an empty panel.
 
 ## Exported Metrics:
 
