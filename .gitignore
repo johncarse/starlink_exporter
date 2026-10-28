@@ -2,3 +2,18 @@ proto/
 dist/
 make.sh
 .idea/
+
+# Local build output and scratch files
+/starlink_exporter
+*.test
+*.out
+*.prom
+
+# Credentials and cluster access: never commit these
+.env
+.env.*
+*.pem
+*.key
+kubeconfig*
+.docker/
+.claude/

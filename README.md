@@ -43,7 +43,7 @@ go test ./...
 
 ### Container image
 
-`Dockerfile.build` builds from source (the upstream `Dockerfile` expects a goreleaser binary). `hack/build-image.sh` builds it on an in-cluster BuildKit daemon and pushes `registry.example.com/starlink_exporter:fb-<commit>`; run it from a clean checkout with a kubectl context for the cluster.
+`Dockerfile.build` builds from source (the upstream `Dockerfile` expects a goreleaser binary). `hack/build-image.sh` builds it on a BuildKit daemon running in a Kubernetes cluster and pushes `$REGISTRY/starlink_exporter:fb-<commit>`. Run it from a clean checkout with a kubectl context for the cluster, `REGISTRY` set to your registry host and `CREDENTIALS_SECRET` set to the `<namespace>/<name>` of a Secret holding the registry password; the script header lists the optional settings.
 
 ### Regenerating the protos
 

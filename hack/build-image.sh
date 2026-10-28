@@ -1,16 +1,29 @@
 #!/usr/bin/env bash
-# Builds the exporter on the in-cluster BuildKit daemon (buildkit/buildkitd) and
-# pushes it to Zot, tagged fb-<commit>. Nothing goes through GitHub: the source
-# streams from this checkout over a kubectl port-forward and buildkitd pushes
-# straight to Zot.
+# Builds the exporter on a BuildKit daemon running in a Kubernetes cluster and
+# pushes it to your registry, tagged fb-<commit>. Nothing goes through a CI
+# service: the source streams from this checkout over a kubectl port-forward and
+# buildkitd pushes straight to the registry.
 #
-# Needs: kubectl context for your-cluster, docker with buildx. Run from the repo root.
+# Needs: a kubectl context for the cluster, docker with buildx, and crane
+# (optional, prints the digest). Run from the repo root with:
+#   REGISTRY            registry host to push to, e.g. registry.example.com
+#   CREDENTIALS_SECRET  <namespace>/<name> of a Secret whose "password" key is
+#                       the registry login
+# and optionally:
+#   REGISTRY_USER       registry user (default ci)
+#   BUILDKIT_TARGET     <namespace>/<service> of buildkitd (default buildkit/buildkitd)
+#   BUILDKIT_PORT       buildkitd service port (default 1234)
+#   BUILDKIT_LOCAL_PORT local port for the port-forward (default 11234)
 set -euo pipefail
 
-REGISTRY=registry.example.com
+REGISTRY=${REGISTRY:?set REGISTRY to the registry host to push to}
+CREDENTIALS_SECRET=${CREDENTIALS_SECRET:?set CREDENTIALS_SECRET to <namespace>/<name> of the registry login Secret}
+REGISTRY_USER=${REGISTRY_USER:-ci}
+BUILDKIT_TARGET=${BUILDKIT_TARGET:-buildkit/buildkitd}
+BUILDKIT_PORT=${BUILDKIT_PORT:-1234}
+PORT=${BUILDKIT_LOCAL_PORT:-11234}
 IMAGE=starlink_exporter
 BUILDER=starlink-exporter-buildkitd
-PORT=${BUILDKIT_LOCAL_PORT:-11234}
 
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   echo "refusing to build: uncommitted changes (the tag is derived from the commit)" >&2
@@ -18,10 +31,10 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
 fi
 REF="${REGISTRY}/${IMAGE}:fb-$(git rev-parse --short=8 HEAD)"
 
-# Throwaway docker config holding the Zot CI login; removed on exit.
+# Throwaway docker config holding the registry login; removed on exit.
 DOCKER_CONFIG="$(mktemp -d)"
 export DOCKER_CONFIG
-kubectl -n buildkit port-forward svc/buildkitd "${PORT}:1234" >/dev/null 2>&1 &
+kubectl -n "${BUILDKIT_TARGET%%/*}" port-forward "svc/${BUILDKIT_TARGET##*/}" "${PORT}:${BUILDKIT_PORT}" >/dev/null 2>&1 &
 PF_PID=$!
 cleanup() {
   kill "$PF_PID" 2>/dev/null || true
@@ -35,11 +48,12 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 
-kubectl -n zot get secret registry-credentials -o jsonpath='{.data.password}' | base64 -d |
-  docker login "$REGISTRY" -u ci --password-stdin >/dev/null
+kubectl -n "${CREDENTIALS_SECRET%%/*}" get secret "${CREDENTIALS_SECRET##*/}" -o jsonpath='{.data.password}' | base64 -d |
+  docker login "$REGISTRY" -u "$REGISTRY_USER" --password-stdin >/dev/null
 docker buildx create --name "$BUILDER" --driver remote "tcp://127.0.0.1:${PORT}" >/dev/null
 
-# Zot only accepts OCI manifests (415 on Docker schema2), so force OCI media types.
+# Some registries (Zot, for one) only accept OCI manifests and answer 415 to
+# Docker schema2, so force OCI media types.
 docker buildx build --builder "$BUILDER" --platform linux/amd64 --provenance=false \
   -f Dockerfile.build \
   --output "type=image,name=${REF},push=true,oci-mediatypes=true" .
