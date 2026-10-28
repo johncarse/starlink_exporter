@@ -324,6 +324,23 @@ var (
 		"Whether water is detected in the router",
 		nil, nil,
 	)
+
+	// collectDishObstructionMap
+	dishObstructionSectorFraction = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "dish", "obstruction_sector_fraction"),
+		"Share of the observed sky in a compass sector that is obstructed, from the dish obstruction map",
+		[]string{"sector"}, nil,
+	)
+	dishObstructionSectorClearAboveDeg = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "dish", "obstruction_sector_clear_above_elevation_deg"),
+		"Elevation from which a compass sector is clear all the way up: the top of the skyline, or the lowest observed elevation when nothing is obstructed",
+		[]string{"sector"}, nil,
+	)
+	dishObstructionSectorObservedFraction = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "dish", "obstruction_sector_observed_fraction"),
+		"Share of a compass sector of the sky that the obstruction map has data for (it empties when the dish reboots)",
+		[]string{"sector"}, nil,
+	)
 )
 
 // Exporter collects Starlink stats from the Dish and exports them using
@@ -418,6 +435,11 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- dishSoftwareUpdateRebootScheduled
 	ch <- dishSecondsUntilSoftwareUpdateRebootPossible
 
+	// collectDishObstructionMap
+	ch <- dishObstructionSectorFraction
+	ch <- dishObstructionSectorClearAboveDeg
+	ch <- dishObstructionSectorObservedFraction
+
 	// collectDishAlerts
 	ch <- dishAlertMotorsStuck
 	ch <- dishAlertThermalThrottle
@@ -451,6 +473,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		e.collectDishObstructions(ch, dishStatus)
 		e.collectDishAlerts(ch, dishStatus)
 		e.collectDishPower(ch)
+		e.collectDishObstructionMap(ch)
 	} else {
 		ok = false
 	}
@@ -787,6 +810,39 @@ func (e *Exporter) collectDishPower(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(
 		dishPowerInputMeanWatts, prometheus.GaugeValue, sum/float64(len(samples)),
 	)
+}
+
+// collectDishObstructionMap exports the obstruction map folded into 16 compass
+// sectors. The raw map is a 123x123 grid, far too many cells for labels, and it
+// is a separate, larger request, so failures are logged and skipped rather than
+// failing the scrape.
+func (e *Exporter) collectDishObstructionMap(ch chan<- prometheus.Metric) {
+	req := &device.Request{
+		Request: &device.Request_DishGetObstructionMap{},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+	defer cancel()
+	resp, err := e.Client.Handle(ctx, req)
+	if err != nil {
+		log.Errorf("failed to collect obstruction map from dish: %s", err.Error())
+		return
+	}
+
+	for _, s := range sectorObstructions(resp.GetDishGetObstructionMap()) {
+		ch <- prometheus.MustNewConstMetric(
+			dishObstructionSectorObservedFraction, prometheus.GaugeValue, s.observed, s.name,
+		)
+		if s.observed == 0 {
+			continue // no data: a zero fraction or elevation would read as "clear"
+		}
+		ch <- prometheus.MustNewConstMetric(
+			dishObstructionSectorFraction, prometheus.GaugeValue, s.obstructed, s.name,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			dishObstructionSectorClearAboveDeg, prometheus.GaugeValue, s.clearAbove, s.name,
+		)
+	}
 }
 
 func flool(b bool) float64 {

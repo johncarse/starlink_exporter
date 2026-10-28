@@ -3,6 +3,7 @@ package exporter
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -14,7 +15,7 @@ import (
 	"github.com/danopstech/starlink_exporter/pkg/spacex.com/api/device"
 )
 
-// fakeDish answers the three requests the exporter makes. A nil response with
+// fakeDish answers the four requests the exporter makes. A nil response with
 // a non-nil error makes that request fail.
 type fakeDish struct {
 	status     *device.DishGetStatusResponse
@@ -23,6 +24,9 @@ type fakeDish struct {
 	contextErr error
 	history    *device.DishGetHistoryResponse
 	historyErr error
+
+	obstruction    *device.DishGetObstructionMapResponse
+	obstructionErr error
 }
 
 func (f *fakeDish) Stream(ctx context.Context, opts ...grpc.CallOption) (device.Device_StreamClient, error) {
@@ -46,6 +50,11 @@ func (f *fakeDish) Handle(ctx context.Context, in *device.Request, opts ...grpc.
 			return nil, f.historyErr
 		}
 		return &device.Response{Response: &device.Response_DishGetHistory{DishGetHistory: f.history}}, nil
+	case *device.Request_DishGetObstructionMap:
+		if f.obstructionErr != nil {
+			return nil, f.obstructionErr
+		}
+		return &device.Response{Response: &device.Response_DishGetObstructionMap{DishGetObstructionMap: f.obstruction}}, nil
 	}
 	return nil, errors.New("unexpected request")
 }
@@ -344,5 +353,210 @@ func TestEveryDescribedMetricHasUniqueName(t *testing.T) {
 	}
 	if _, err := reg.Gather(); err != nil {
 		t.Fatalf("pedantic gather failed: %v", err)
+	}
+}
+
+// mapSize is odd so the zenith falls on a cell; each cell then spans
+// 80/(mapSize-1)*2 = about 1.3 degrees of elevation.
+const mapSize = 123
+
+// skyMap builds an earth-fixed obstruction map where fill decides each cell's
+// value from its compass heading and elevation.
+func skyMap(fill func(heading, elevation float64) float32) *device.DishGetObstructionMapResponse {
+	centre := float64(mapSize-1) / 2
+	snr := make([]float32, mapSize*mapSize)
+	for row := 0; row < mapSize; row++ {
+		for col := 0; col < mapSize; col++ {
+			dx, dy := float64(col)-centre, centre-float64(row)
+			radius := math.Hypot(dx, dy)
+			if radius > centre {
+				snr[row*mapSize+col] = -1
+				continue
+			}
+			heading := math.Mod(math.Atan2(dx, dy)*180/math.Pi+360, 360)
+			snr[row*mapSize+col] = fill(heading, 90-radius/centre*80)
+		}
+	}
+	return &device.DishGetObstructionMapResponse{
+		NumRows:           mapSize,
+		NumCols:           mapSize,
+		Snr:               snr,
+		MaxThetaDeg:       80,
+		MapReferenceFrame: device.ObstructionMapReferenceFrame_FRAME_EARTH,
+	}
+}
+
+func inSector(heading, centre float64) bool {
+	d := math.Abs(math.Mod(heading-centre+540, 360) - 180)
+	return d <= 11.25
+}
+
+func scrapeSky(t *testing.T, m *device.DishGetObstructionMapResponse) map[string]*dto.MetricFamily {
+	t.Helper()
+	dish := healthyDish()
+	dish.obstruction = m
+	return gather(t, dish)
+}
+
+func TestObstructionSectorFractionIsReportedOnlyForTheObstructedSector(t *testing.T) {
+	families := scrapeSky(t, skyMap(func(heading, elevation float64) float32 {
+		if inSector(heading, 315) && elevation < 30 {
+			return 0.1
+		}
+		return 1
+	}))
+
+	if v := labelled(t, families, "starlink_dish_obstruction_sector_fraction", "sector", "NW"); v < 0.3 {
+		t.Errorf("NW fraction = %v, want a substantial share obstructed", v)
+	}
+	for _, sector := range []string{"N", "NNW", "W", "S", "SE"} {
+		if v := labelled(t, families, "starlink_dish_obstruction_sector_fraction", "sector", sector); v != 0 {
+			t.Errorf("%s fraction = %v, want 0", sector, v)
+		}
+	}
+}
+
+func TestObstructionMapIsReadWithNorthUpAndEastRight(t *testing.T) {
+	centre := (mapSize - 1) / 2
+	cases := map[string][2]int{ // sector -> row, col of a cell on that axis
+		"N": {centre - 40, centre},
+		"E": {centre, centre + 40},
+		"S": {centre + 40, centre},
+		"W": {centre, centre - 40},
+	}
+	for sector, cell := range cases {
+		m := skyMap(func(float64, float64) float32 { return 1 })
+		// Blank out a block so the sector clears the band threshold.
+		for dr := -6; dr <= 6; dr++ {
+			for dc := -6; dc <= 6; dc++ {
+				m.Snr[(cell[0]+dr)*mapSize+cell[1]+dc] = 0
+			}
+		}
+		families := scrapeSky(t, m)
+
+		for _, other := range []string{"N", "E", "S", "W"} {
+			got := labelled(t, families, "starlink_dish_obstruction_sector_fraction", "sector", other)
+			if other == sector && got == 0 {
+				t.Errorf("block on the %s axis not reported in sector %s", sector, other)
+			}
+			if other != sector && got != 0 {
+				t.Errorf("block on the %s axis leaked into sector %s (%v)", sector, other, got)
+			}
+		}
+	}
+}
+
+func TestClearAboveElevationIsTheTopOfTheSkylineWhenSectorIsObstructedBelowIt(t *testing.T) {
+	families := scrapeSky(t, skyMap(func(heading, elevation float64) float32 {
+		if inSector(heading, 337.5) && elevation < 30 {
+			return 0
+		}
+		return 1
+	}))
+
+	got := labelled(t, families, "starlink_dish_obstruction_sector_clear_above_elevation_deg", "sector", "NNW")
+	if got < 28 || got > 30 {
+		t.Errorf("NNW clear above = %v, want just under 30", got)
+	}
+}
+
+func TestClearAboveElevationIsTheLowestObservedWhenNothingIsObstructed(t *testing.T) {
+	families := scrapeSky(t, skyMap(func(heading, elevation float64) float32 {
+		if elevation < 25 {
+			return -1 // never observed below 25 degrees
+		}
+		return 1
+	}))
+
+	got := labelled(t, families, "starlink_dish_obstruction_sector_clear_above_elevation_deg", "sector", "E")
+	if got < 25 || got > 27 {
+		t.Errorf("E clear above = %v, want the lowest observed elevation, about 25", got)
+	}
+}
+
+func TestSkylineIgnoresAnIsolatedObstructedCellWhenItsBandIsOtherwiseClear(t *testing.T) {
+	m := skyMap(func(float64, float64) float32 { return 1 })
+	centre := (mapSize - 1) / 2
+	m.Snr[(centre-10)*mapSize+centre] = 0 // one bad cell high in the north
+
+	families := scrapeSky(t, m)
+
+	if got := labelled(t, families, "starlink_dish_obstruction_sector_clear_above_elevation_deg", "sector", "N"); got > 15 {
+		t.Errorf("N clear above = %v, want the lowest observed elevation, not the noisy cell", got)
+	}
+	if got := labelled(t, families, "starlink_dish_obstruction_sector_fraction", "sector", "N"); got == 0 {
+		t.Error("N fraction = 0, want the noisy cell still counted")
+	}
+}
+
+func TestUnobservedSectorReportsCoverageOnlyWhenTheMapHasNoDataThere(t *testing.T) {
+	families := scrapeSky(t, skyMap(func(heading, elevation float64) float32 {
+		if inSector(heading, 180) {
+			return -1
+		}
+		return 1
+	}))
+
+	if got := labelled(t, families, "starlink_dish_obstruction_sector_observed_fraction", "sector", "S"); got != 0 {
+		t.Errorf("S observed = %v, want 0", got)
+	}
+	for _, name := range []string{"starlink_dish_obstruction_sector_fraction", "starlink_dish_obstruction_sector_clear_above_elevation_deg"} {
+		for _, m := range families[name].GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetValue() == "S" {
+					t.Errorf("%s exported for S although it has no data", name)
+				}
+			}
+		}
+	}
+}
+
+func TestEverySectorIsExportedWhenTheMapIsFullyObserved(t *testing.T) {
+	families := scrapeSky(t, skyMap(func(float64, float64) float32 { return 1 }))
+
+	for _, name := range []string{
+		"starlink_dish_obstruction_sector_fraction",
+		"starlink_dish_obstruction_sector_clear_above_elevation_deg",
+		"starlink_dish_obstruction_sector_observed_fraction",
+	} {
+		if got := len(families[name].GetMetric()); got != 16 {
+			t.Errorf("%s has %d series, want 16", name, got)
+		}
+	}
+}
+
+func TestObstructionMetricsAreSkippedWhenTheMapIsNotEarthFixed(t *testing.T) {
+	m := skyMap(func(float64, float64) float32 { return 1 })
+	m.MapReferenceFrame = device.ObstructionMapReferenceFrame_FRAME_UT
+
+	families := scrapeSky(t, m)
+
+	if _, ok := families["starlink_dish_obstruction_sector_fraction"]; ok {
+		t.Error("sector metrics exported for a dish-relative map")
+	}
+}
+
+func TestObstructionMetricsAreSkippedWhenTheMapIsMalformed(t *testing.T) {
+	m := skyMap(func(float64, float64) float32 { return 1 })
+	m.Snr = m.Snr[:100]
+
+	families := scrapeSky(t, m)
+
+	if _, ok := families["starlink_dish_obstruction_sector_fraction"]; ok {
+		t.Error("sector metrics exported for a map whose size does not match its cells")
+	}
+}
+
+func TestScrapeStaysUpAndSkipsObstructionMapWhenRequestFails(t *testing.T) {
+	dish := healthyDish()
+	dish.obstructionErr = status.Error(codes.DeadlineExceeded, "timeout")
+
+	families := gather(t, dish)
+
+	if v := value(t, families, "starlink_dish_up"); v != 1 {
+		t.Errorf("dish_up = %v, want 1", v)
+	}
+	if _, ok := families["starlink_dish_obstruction_sector_fraction"]; ok {
+		t.Error("sector metrics exported although the obstruction map request failed")
 	}
 }
