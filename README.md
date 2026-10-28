@@ -129,6 +129,16 @@ scrape_configs
 # TYPE starlink_dish_gps_satellites gauge
 # HELP starlink_dish_gps_valid Whether the dish has a valid GPS fix
 # TYPE starlink_dish_gps_valid gauge
+# HELP starlink_dish_history_downlink_throughput_bps Downlink throughput over the dish's history window, by statistic (mean, p95, max); real traffic, so a floor on capacity, not a speedtest
+# TYPE starlink_dish_history_downlink_throughput_bps gauge
+# HELP starlink_dish_history_pop_ping_drop_ratio Ping drop ratio over the dish's history window, by statistic (mean, p95, max)
+# TYPE starlink_dish_history_pop_ping_drop_ratio gauge
+# HELP starlink_dish_history_pop_ping_latency_seconds Latency to the Starlink PoP over the dish's history window, by statistic (mean, p95, max), ignoring samples where every ping was lost
+# TYPE starlink_dish_history_pop_ping_latency_seconds gauge
+# HELP starlink_dish_history_uplink_throughput_bps Uplink throughput over the dish's history window, by statistic (mean, p95, max); real traffic, so a floor on capacity, not a speedtest
+# TYPE starlink_dish_history_uplink_throughput_bps gauge
+# HELP starlink_dish_history_window_seconds Length of the dish's 1 Hz history window the history_* metrics summarise (up to 900, less just after a reboot)
+# TYPE starlink_dish_history_window_seconds gauge
 # HELP starlink_dish_info Running software versions and IDs of hardware
 # TYPE starlink_dish_info gauge
 # HELP starlink_dish_obstruction_sector_clear_above_elevation_deg Elevation from which a compass sector is clear all the way up: the top of the skyline, or the lowest observed elevation when nothing is obstructed
@@ -137,6 +147,10 @@ scrape_configs
 # TYPE starlink_dish_obstruction_sector_fraction gauge
 # HELP starlink_dish_obstruction_sector_observed_fraction Share of a compass sector of the sky that the obstruction map has data for (it empties when the dish reboots)
 # TYPE starlink_dish_obstruction_sector_observed_fraction gauge
+# HELP starlink_dish_outage_seconds_total Time spent in outage since this exporter started, by cause
+# TYPE starlink_dish_outage_seconds_total counter
+# HELP starlink_dish_outages_total Outages the dish reported since this exporter started, by cause
+# TYPE starlink_dish_outages_total counter
 # HELP starlink_dish_pop_ping_drop_ratio Percent of pings dropped
 # TYPE starlink_dish_pop_ping_drop_ratio gauge
 # HELP starlink_dish_pop_ping_latency_seconds Latency of connection in seconds
@@ -190,6 +204,8 @@ Notes:
 - `starlink_dish_software_update_reboot_scheduled_timestamp_seconds` is the Unix time of the scheduled update reboot, 0 when none is scheduled.
 - `starlink_dish_cell_id`, `pop_rack_id`, `initial_satellite_id`, `initial_gateway_id`, `backup_beam` and `time_to_slot_end_seconds` come from `dish_get_context`, which current firmware denies. They are exported only when the dish allows that call, so they are not in the list above.
 - `starlink_dish_obstruction_sector_*{sector}` fold the dish's obstruction map (`dish_get_obstruction_map`, a 123x123 polar grid of the sky) into 16 compass sectors, N, NNE, NE and so on. `fraction` is the share of the sector's observed cells with signal quality under 0.5. `clear_above_elevation_deg` is the elevation from which the sector is clear all the way up: the top of the skyline (the highest 5 degree elevation band that is at least a quarter obstructed), or the lowest observed elevation when nothing is obstructed. `observed_fraction` is how much of the sector the map has data for. The map is earth-fixed with north up, and its radius is read as linear in angle from the zenith out to `max_theta_deg`. The dish empties the map when it reboots and refills it as satellites pass, so for a day or two after a reboot some sectors, mostly the south, have little or no data. A sector with no data exports only `observed_fraction`, never a zero `fraction` that would read as clear.
+- `starlink_dish_history_*{stat}` summarise the dish's own 15 minute history (900 samples at 1 Hz) that a single `get_status` snapshot misses: mean, p95 (nearest rank) and max of downlink and uplink throughput, PoP ping latency and ping drop. They are passive, real-traffic measurements, so the throughput maximum is a floor on what the link can do, not a speedtest. Latency ignores samples where every ping was lost. Just after a reboot the ring is only partly filled; only recorded samples count and `history_window_seconds` says how many. The dish has no speedtest of its own: it answers `get_speedtest_status` with Unimplemented.
+- `starlink_dish_outages_total{cause}` and `outage_seconds_total{cause}` count the outages the dish lists, by cause (BOOTING, NO_PINGS, NO_SATS, OBSTRUCTED and so on). The dish keeps only a short bounded list, so the exporter builds the counters from what it sees: outages already listed when it starts are not counted, and every cause exports 0 from the first scrape so `rate()` and `increase()` work.
 - Removed because current firmware no longer sends the fields: `starlink_dish_state`, `starlink_dish_snr`, `starlink_dish_last_24h_obstructed_seconds` and the `wedge` obstruction ratios. Use `snr_above_noise_floor`, `ready_state` and the label-based `state` instead.
 
 ## Example Grafana Dashboard:

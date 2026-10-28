@@ -325,6 +325,43 @@ var (
 		nil, nil,
 	)
 
+	// collectDishHistory
+	dishHistoryWindowSeconds = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "dish", "history_window_seconds"),
+		"Length of the dish's 1 Hz history window the history_* metrics summarise (up to 900, less just after a reboot)",
+		nil, nil,
+	)
+	dishHistoryDownlinkThroughputBps = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "dish", "history_downlink_throughput_bps"),
+		"Downlink throughput over the dish's history window, by statistic (mean, p95, max); real traffic, so a floor on capacity, not a speedtest",
+		[]string{"stat"}, nil,
+	)
+	dishHistoryUplinkThroughputBps = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "dish", "history_uplink_throughput_bps"),
+		"Uplink throughput over the dish's history window, by statistic (mean, p95, max); real traffic, so a floor on capacity, not a speedtest",
+		[]string{"stat"}, nil,
+	)
+	dishHistoryPopPingLatencySeconds = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "dish", "history_pop_ping_latency_seconds"),
+		"Latency to the Starlink PoP over the dish's history window, by statistic (mean, p95, max), ignoring samples where every ping was lost",
+		[]string{"stat"}, nil,
+	)
+	dishHistoryPopPingDropRatio = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "dish", "history_pop_ping_drop_ratio"),
+		"Ping drop ratio over the dish's history window, by statistic (mean, p95, max)",
+		[]string{"stat"}, nil,
+	)
+	dishOutagesTotal = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "dish", "outages_total"),
+		"Outages the dish reported since this exporter started, by cause",
+		[]string{"cause"}, nil,
+	)
+	dishOutageSecondsTotal = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "dish", "outage_seconds_total"),
+		"Time spent in outage since this exporter started, by cause",
+		[]string{"cause"}, nil,
+	)
+
 	// collectDishObstructionMap
 	dishObstructionSectorFraction = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "dish", "obstruction_sector_fraction"),
@@ -350,6 +387,8 @@ type Exporter struct {
 	Client      device.DeviceClient
 	DishID      string
 	CountryCode string
+
+	outages outageTracker
 }
 
 // New returns an initialized Exporter.
@@ -435,6 +474,15 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- dishSoftwareUpdateRebootScheduled
 	ch <- dishSecondsUntilSoftwareUpdateRebootPossible
 
+	// collectDishHistory
+	ch <- dishHistoryWindowSeconds
+	ch <- dishHistoryDownlinkThroughputBps
+	ch <- dishHistoryUplinkThroughputBps
+	ch <- dishHistoryPopPingLatencySeconds
+	ch <- dishHistoryPopPingDropRatio
+	ch <- dishOutagesTotal
+	ch <- dishOutageSecondsTotal
+
 	// collectDishObstructionMap
 	ch <- dishObstructionSectorFraction
 	ch <- dishObstructionSectorClearAboveDeg
@@ -472,7 +520,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		e.collectDishSoftwareUpdate(ch, dishStatus)
 		e.collectDishObstructions(ch, dishStatus)
 		e.collectDishAlerts(ch, dishStatus)
-		e.collectDishPower(ch)
+		e.collectDishHistory(ch)
 		e.collectDishObstructionMap(ch)
 	} else {
 		ok = false
@@ -773,10 +821,11 @@ func dishConnectionStates() []string {
 	return states
 }
 
-// collectDishPower exports the dish's power draw from get_history. History is
-// the heaviest call, so failures are logged and skipped rather than failing the
-// scrape.
-func (e *Exporter) collectDishPower(ch chan<- prometheus.Metric) {
+// collectDishHistory exports power draw and a summary of the dish's 15 minute
+// history, which get_status's single snapshot misses (bursts, worst latency),
+// and counts the outages the dish lists. History is the heaviest call, so
+// failures are logged and skipped rather than failing the scrape.
+func (e *Exporter) collectDishHistory(ch chan<- prometheus.Metric) {
 	req := &device.Request{
 		Request: &device.Request_GetHistory{},
 	}
@@ -790,26 +839,63 @@ func (e *Exporter) collectDishPower(ch chan<- prometheus.Metric) {
 	}
 
 	history := resp.GetDishGetHistory()
-	samples := history.GetPowerIn()
-	if len(samples) == 0 {
+	current := history.GetCurrent()
+
+	power := recorded(history.GetPowerIn(), current)
+	if latest, ok := newest(history.GetPowerIn(), current); ok {
+		var sum float64
+		for _, v := range power {
+			sum += float64(v)
+		}
+		ch <- prometheus.MustNewConstMetric(
+			dishPowerInputWatts, prometheus.GaugeValue, float64(latest),
+		)
+		ch <- prometheus.MustNewConstMetric(
+			dishPowerInputMeanWatts, prometheus.GaugeValue, sum/float64(len(power)),
+		)
+	}
+
+	downlink := recorded(history.GetDownlinkThroughputBps(), current)
+	uplink := recorded(history.GetUplinkThroughputBps(), current)
+	drop := recorded(history.GetPopPingDropRate(), current)
+	latency := recorded(history.GetPopPingLatencyMs(), current)
+	if window := len(downlink); window > 0 {
+		ch <- prometheus.MustNewConstMetric(
+			dishHistoryWindowSeconds, prometheus.GaugeValue, float64(window),
+		)
+	}
+	emitSummary(ch, dishHistoryDownlinkThroughputBps, float64s(downlink), 1)
+	emitSummary(ch, dishHistoryUplinkThroughputBps, float64s(uplink), 1)
+	emitSummary(ch, dishHistoryPopPingDropRatio, float64s(drop), 1)
+	emitSummary(ch, dishHistoryPopPingLatencySeconds, latencyWhenAnswered(latency, drop), 1e-3)
+
+	e.outages.observe(history.GetOutages())
+	count, seconds := e.outages.totals()
+	causes := make([]string, 0, len(device.DishOutage_Cause_name))
+	for _, name := range device.DishOutage_Cause_name {
+		causes = append(causes, name)
+	}
+	sort.Strings(causes)
+	for _, cause := range causes {
+		ch <- prometheus.MustNewConstMetric(
+			dishOutagesTotal, prometheus.CounterValue, count[cause], cause,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			dishOutageSecondsTotal, prometheus.CounterValue, seconds[cause], cause,
+		)
+	}
+}
+
+// emitSummary exports the mean, p95 and max of samples, scaled, as three
+// series of desc told apart by a stat label.
+func emitSummary(ch chan<- prometheus.Metric, desc *prometheus.Desc, samples []float64, scale float64) {
+	s, ok := summarise(samples)
+	if !ok {
 		return
 	}
-
-	// The history is a ring buffer: current counts every sample ever taken, so
-	// the newest one sits just behind current modulo the buffer length.
-	latest := samples[(history.GetCurrent()+uint64(len(samples))-1)%uint64(len(samples))]
-
-	var sum float64
-	for _, v := range samples {
-		sum += float64(v)
-	}
-
-	ch <- prometheus.MustNewConstMetric(
-		dishPowerInputWatts, prometheus.GaugeValue, float64(latest),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		dishPowerInputMeanWatts, prometheus.GaugeValue, sum/float64(len(samples)),
-	)
+	ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, s.mean*scale, "mean")
+	ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, s.p95*scale, "p95")
+	ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, s.max*scale, "max")
 }
 
 // collectDishObstructionMap exports the obstruction map folded into 16 compass

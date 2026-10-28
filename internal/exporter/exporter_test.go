@@ -128,6 +128,9 @@ func labelled(t *testing.T, families map[string]*dto.MetricFamily, name, label, 
 	for _, m := range f.GetMetric() {
 		for _, l := range m.GetLabel() {
 			if l.GetName() == label && l.GetValue() == want {
+				if f.GetType() == dto.MetricType_COUNTER {
+					return m.GetCounter().GetValue()
+				}
 				return m.GetGauge().GetValue()
 			}
 		}
@@ -307,8 +310,9 @@ func TestEthernetSpeedAndReadyStatesAreExported(t *testing.T) {
 
 func TestPowerReadsTheNewestSampleWhenTheHistoryRingHasWrapped(t *testing.T) {
 	dish := healthyDish()
-	// 4 samples, 3 taken so far this lap: the newest is index 2 (value 50).
-	dish.history = &device.DishGetHistoryResponse{Current: 3, PowerIn: []float32{30, 40, 50, 60}}
+	// 7 samples taken into 4 slots: the ring has wrapped, every slot is live and
+	// the newest is index 2 (value 50).
+	dish.history = &device.DishGetHistoryResponse{Current: 7, PowerIn: []float32{30, 40, 50, 60}}
 
 	families := gather(t, dish)
 
@@ -317,6 +321,21 @@ func TestPowerReadsTheNewestSampleWhenTheHistoryRingHasWrapped(t *testing.T) {
 	}
 	if v := value(t, families, "starlink_dish_power_input_mean_watts"); v != 45 {
 		t.Errorf("power_input_mean_watts = %v, want 45", v)
+	}
+}
+
+func TestPowerIgnoresUnwrittenSlotsWhenTheRingHasNotFilledYet(t *testing.T) {
+	dish := healthyDish()
+	// Just after a boot: 3 samples in 4 slots, the last slot still zero.
+	dish.history = &device.DishGetHistoryResponse{Current: 3, PowerIn: []float32{30, 40, 50, 0}}
+
+	families := gather(t, dish)
+
+	if v := value(t, families, "starlink_dish_power_input_watts"); v != 50 {
+		t.Errorf("power_input_watts = %v, want 50", v)
+	}
+	if v := value(t, families, "starlink_dish_power_input_mean_watts"); v != 40 {
+		t.Errorf("power_input_mean_watts = %v, want 40 (mean of the 3 recorded)", v)
 	}
 }
 
@@ -342,6 +361,9 @@ func TestScrapeStaysUpAndSkipsPowerWhenHistoryFails(t *testing.T) {
 	}
 	if _, ok := families["starlink_dish_power_input_watts"]; ok {
 		t.Error("power_input_watts exported although get_history failed")
+	}
+	if _, ok := families["starlink_dish_outages_total"]; ok {
+		t.Error("outages_total exported although get_history failed")
 	}
 }
 
@@ -558,5 +580,194 @@ func TestScrapeStaysUpAndSkipsObstructionMapWhenRequestFails(t *testing.T) {
 	}
 	if _, ok := families["starlink_dish_obstruction_sector_fraction"]; ok {
 		t.Error("sector metrics exported although the obstruction map request failed")
+	}
+}
+
+// gatherFrom scrapes an existing exporter, so state kept between scrapes
+// survives.
+func gatherFrom(t *testing.T, e *Exporter) map[string]*dto.MetricFamily {
+	t.Helper()
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(e)
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather failed: %v", err)
+	}
+	byName := map[string]*dto.MetricFamily{}
+	for _, f := range families {
+		byName[f.GetName()] = f
+	}
+	return byName
+}
+
+// statOf returns the series of a metric whose stat label matches.
+func statOf(t *testing.T, families map[string]*dto.MetricFamily, name, stat string) float64 {
+	t.Helper()
+	return labelled(t, families, name, "stat", stat)
+}
+
+func historyDish(h *device.DishGetHistoryResponse) *fakeDish {
+	dish := healthyDish()
+	dish.history = h
+	return dish
+}
+
+func TestHistoryThroughputIsSummarisedAsMeanP95AndMaxInBitsPerSecond(t *testing.T) {
+	families := gather(t, historyDish(&device.DishGetHistoryResponse{
+		Current:               100,
+		DownlinkThroughputBps: []float32{1e6, 2e6, 3e6, 100e6},
+		UplinkThroughputBps:   []float32{1e5, 1e5, 1e5, 5e5},
+	}))
+
+	name := "starlink_dish_history_downlink_throughput_bps"
+	if v := statOf(t, families, name, "max"); v != 100e6 {
+		t.Errorf("downlink max = %v, want 100e6", v)
+	}
+	if v := statOf(t, families, name, "mean"); v != 26.5e6 {
+		t.Errorf("downlink mean = %v, want 26.5e6", v)
+	}
+	if v := statOf(t, families, name, "p95"); v != 100e6 {
+		t.Errorf("downlink p95 = %v, want 100e6 (nearest rank of 4 samples)", v)
+	}
+	if v := statOf(t, families, "starlink_dish_history_uplink_throughput_bps", "max"); v != 5e5 {
+		t.Errorf("uplink max = %v, want 5e5", v)
+	}
+}
+
+func TestHistoryP95IsTheNearestRankSampleWhenTheWindowIsLarge(t *testing.T) {
+	// 100 samples 1..100: the 95th is 95.
+	down := make([]float32, 100)
+	for i := range down {
+		down[i] = float32(i + 1)
+	}
+	families := gather(t, historyDish(&device.DishGetHistoryResponse{Current: 100, DownlinkThroughputBps: down}))
+
+	if v := statOf(t, families, "starlink_dish_history_downlink_throughput_bps", "p95"); v != 95 {
+		t.Errorf("p95 = %v, want 95", v)
+	}
+}
+
+func TestHistoryLatencyIsExportedInSecondsAndSkipsSamplesWhereEveryPingWasLost(t *testing.T) {
+	families := gather(t, historyDish(&device.DishGetHistoryResponse{
+		Current:          100,
+		PopPingLatencyMs: []float32{20, 30, 0, 40},
+		PopPingDropRate:  []float32{0, 0.5, 1, 0},
+	}))
+
+	name := "starlink_dish_history_pop_ping_latency_seconds"
+	if v := statOf(t, families, name, "mean"); math.Abs(v-0.030) > 1e-9 {
+		t.Errorf("latency mean = %v, want 0.030 (the lost sample ignored)", v)
+	}
+	if v := statOf(t, families, name, "max"); math.Abs(v-0.040) > 1e-9 {
+		t.Errorf("latency max = %v, want 0.040", v)
+	}
+	if v := statOf(t, families, "starlink_dish_history_pop_ping_drop_ratio", "max"); v != 1 {
+		t.Errorf("drop max = %v, want 1", v)
+	}
+}
+
+func TestHistoryIgnoresUnwrittenSlotsAndReportsTheWindowWhenTheRingHasNotFilledYet(t *testing.T) {
+	families := gather(t, historyDish(&device.DishGetHistoryResponse{
+		Current:               2,
+		DownlinkThroughputBps: []float32{10, 30, 0, 0},
+	}))
+
+	if v := value(t, families, "starlink_dish_history_window_seconds"); v != 2 {
+		t.Errorf("window_seconds = %v, want 2", v)
+	}
+	if v := statOf(t, families, "starlink_dish_history_downlink_throughput_bps", "mean"); v != 20 {
+		t.Errorf("downlink mean = %v, want 20 (zeros in unwritten slots excluded)", v)
+	}
+}
+
+func TestHistoryMetricsAreOmittedWhenTheDishHasRecordedNothingYet(t *testing.T) {
+	families := gather(t, historyDish(&device.DishGetHistoryResponse{
+		Current:               0,
+		DownlinkThroughputBps: []float32{0, 0, 0, 0},
+	}))
+
+	if _, ok := families["starlink_dish_history_downlink_throughput_bps"]; ok {
+		t.Error("history summary exported with no samples recorded")
+	}
+	if _, ok := families["starlink_dish_history_window_seconds"]; ok {
+		t.Error("window_seconds exported with no samples recorded")
+	}
+}
+
+func outage(cause device.DishOutage_Cause, start int64, durationNs uint64) *device.DishOutage {
+	return &device.DishOutage{Cause: cause, StartTimestampNs: start, DurationNs: durationNs}
+}
+
+func TestOutageCountersStayAtZeroOnTheFirstScrapeWhenOutagesAreAlreadyListed(t *testing.T) {
+	dish := historyDish(&device.DishGetHistoryResponse{
+		Current: 100,
+		Outages: []*device.DishOutage{outage(device.DishOutage_BOOTING, 1000, 56e9)},
+	})
+
+	families := gather(t, dish)
+
+	if v := labelled(t, families, "starlink_dish_outages_total", "cause", "BOOTING"); v != 0 {
+		t.Errorf("BOOTING outages_total = %v, want 0 (it predates this exporter)", v)
+	}
+}
+
+func TestOutageCountersCountANewOutageOnceWhenItAppearsInTheList(t *testing.T) {
+	dish := historyDish(&device.DishGetHistoryResponse{Current: 100})
+	e := &Exporter{Client: dish}
+	gatherFrom(t, e) // first scrape seeds the tracker
+
+	dish.history.Outages = []*device.DishOutage{outage(device.DishOutage_NO_PINGS, 5000, 2e9)}
+	gatherFrom(t, e)
+	families := gatherFrom(t, e) // the same outage seen again must not recount
+
+	if v := labelled(t, families, "starlink_dish_outages_total", "cause", "NO_PINGS"); v != 1 {
+		t.Errorf("NO_PINGS outages_total = %v, want 1", v)
+	}
+	if v := labelled(t, families, "starlink_dish_outage_seconds_total", "cause", "NO_PINGS"); v != 2 {
+		t.Errorf("NO_PINGS outage_seconds_total = %v, want 2", v)
+	}
+	if v := labelled(t, families, "starlink_dish_outages_total", "cause", "OBSTRUCTED"); v != 0 {
+		t.Errorf("OBSTRUCTED outages_total = %v, want 0", v)
+	}
+}
+
+func TestOutageSecondsGrowByTheDeltaWhenAnOutageIsStillInProgress(t *testing.T) {
+	dish := historyDish(&device.DishGetHistoryResponse{Current: 100})
+	e := &Exporter{Client: dish}
+	gatherFrom(t, e)
+
+	dish.history.Outages = []*device.DishOutage{outage(device.DishOutage_NO_SATS, 7000, 3e9)}
+	gatherFrom(t, e)
+	dish.history.Outages = []*device.DishOutage{outage(device.DishOutage_NO_SATS, 7000, 10e9)}
+	families := gatherFrom(t, e)
+
+	if v := labelled(t, families, "starlink_dish_outages_total", "cause", "NO_SATS"); v != 1 {
+		t.Errorf("NO_SATS outages_total = %v, want 1", v)
+	}
+	if v := labelled(t, families, "starlink_dish_outage_seconds_total", "cause", "NO_SATS"); v != 10 {
+		t.Errorf("NO_SATS outage_seconds_total = %v, want 10, not 13", v)
+	}
+}
+
+func TestOutageCountersKeepTheirTotalWhenAnOutageAgesOutOfTheList(t *testing.T) {
+	dish := historyDish(&device.DishGetHistoryResponse{Current: 100})
+	e := &Exporter{Client: dish}
+	gatherFrom(t, e)
+	dish.history.Outages = []*device.DishOutage{outage(device.DishOutage_OBSTRUCTED, 9000, 4e9)}
+	gatherFrom(t, e)
+
+	dish.history.Outages = nil
+	families := gatherFrom(t, e)
+
+	if v := labelled(t, families, "starlink_dish_outages_total", "cause", "OBSTRUCTED"); v != 1 {
+		t.Errorf("OBSTRUCTED outages_total = %v, want 1 to survive the list emptying", v)
+	}
+}
+
+func TestEveryOutageCauseHasACounterSeriesFromTheFirstScrape(t *testing.T) {
+	families := gather(t, historyDish(&device.DishGetHistoryResponse{Current: 100}))
+
+	if got, want := len(families["starlink_dish_outages_total"].GetMetric()), len(device.DishOutage_Cause_name); got != want {
+		t.Errorf("outages_total has %d series, want %d", got, want)
 	}
 }
